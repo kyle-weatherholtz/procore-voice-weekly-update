@@ -1,0 +1,18 @@
+# Live credentials — never commit
+config.json
+
+# Generated output archive
+output/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
