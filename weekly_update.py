@@ -13,9 +13,9 @@ Usage:
 """
 
 import argparse
-import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -99,6 +99,7 @@ def fetch_github_data(config: dict, since: datetime) -> dict:
         batch = resp.json()
         if not batch:
             break
+        done = False
         for pr in batch:
             if pr.get("merged_at") and pr["merged_at"] >= since_iso:
                 prs.append({
@@ -110,10 +111,9 @@ def fetch_github_data(config: dict, since: datetime) -> dict:
                     "url": pr["html_url"],
                 })
             elif pr.get("updated_at", "") < since_iso:
-                # PRs are sorted by updated desc; once we pass the window, stop
-                batch = []  # signal to break outer loop
+                done = True
                 break
-        if not batch:
+        if done:
             break
         page += 1
 
@@ -134,26 +134,112 @@ def fetch_github_data(config: dict, since: datetime) -> dict:
                     "author": c["commit"]["author"]["name"],
                     "date": c["commit"]["author"]["date"],
                 })
-            break  # got results from this branch, don't try master
+            break
 
     print(f"  GitHub: {len(prs)} merged PRs, {len(commits)} commits")
     return {"prs": prs, "commits": commits}
 
 
 # ---------------------------------------------------------------------------
-# Jira
+# Atlassian MCP (Jira + Confluence)
 # ---------------------------------------------------------------------------
 
-def fetch_jira_data(config: dict, since: datetime) -> list:
+ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
+
+
+class AtlassianMCP:
+    """Context manager that wraps a single npx mcp-remote subprocess for all Atlassian calls."""
+
+    def __init__(self):
+        self.proc = None
+        self._req_id = 1
+        self.cloud_id = None
+
+    def _rpc(self, method: str, params: dict) -> dict:
+        req_id = self._req_id
+        self._req_id += 1
+        msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}) + "\n"
+        self.proc.stdin.write(msg)
+        self.proc.stdin.flush()
+        # Read lines until we find the response for our req_id (skip non-JSON / notifications)
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Atlassian MCP process closed stdout unexpectedly")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                resp = json.loads(line)
+                if resp.get("id") == req_id:
+                    return resp
+                # Otherwise it's a notification or a different response — keep reading
+            except json.JSONDecodeError:
+                continue
+
+    def call(self, tool_name: str, arguments: dict) -> str:
+        """Call a tool and return the text of the first content item."""
+        resp = self._rpc("tools/call", {"name": tool_name, "arguments": arguments})
+        if "error" in resp:
+            raise RuntimeError(f"Atlassian MCP tool error ({tool_name}): {resp['error']}")
+        for item in resp.get("result", {}).get("content", []):
+            if item.get("type") == "text":
+                return item["text"]
+        return ""
+
+    def start(self):
+        self.proc = subprocess.Popen(
+            ["npx", "--yes", "mcp-remote", ATLASSIAN_MCP_URL],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        init_resp = self._rpc("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "procore-voice-weekly-update", "version": "1.0"},
+        })
+        if "error" in init_resp:
+            raise RuntimeError(f"Atlassian MCP init error: {init_resp['error']}")
+
+        # Notification — no response expected
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        self.proc.stdin.flush()
+
+        # Resolve cloud ID (needed for all subsequent calls)
+        text = self.call("getAccessibleAtlassianResources", {})
+        try:
+            resources = json.loads(text)
+            if isinstance(resources, list) and resources:
+                self.cloud_id = resources[0]["id"]
+            else:
+                raise RuntimeError(f"Unexpected resources response: {text[:200]}")
+        except (json.JSONDecodeError, KeyError) as e:
+            raise RuntimeError(f"Could not parse Atlassian cloud ID: {e}\nResponse: {text[:200]}")
+
+        return self
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *_args):
+        self.stop()
+
+
+def fetch_jira_data(atlassian: AtlassianMCP, config: dict, since: datetime) -> list:
     """Fetch closed/transitioned Jira tickets from FSAD + MARCH boards."""
-    email = config["atlassian_email"]
-    token = config["atlassian_api_token"]
-    base = config["atlassian_base_url"]
     projects = config.get("jira_projects", ["FSAD", "MARCH"])
-
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
-    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
-
+    base_url = config.get("atlassian_base_url", "https://procoretech.atlassian.net")
     since_str = since.strftime("%Y-%m-%d")
     project_filter = ", ".join(f'"{p}"' for p in projects)
     jql = (
@@ -163,67 +249,83 @@ def fetch_jira_data(config: dict, since: datetime) -> list:
         f'ORDER BY updated DESC'
     )
 
+    text = atlassian.call("searchJiraIssuesUsingJql", {
+        "cloudId": atlassian.cloud_id,
+        "jql": jql,
+        "maxResults": 50,
+        "fields": "summary,status,assignee,priority,labels",
+        "responseContentFormat": "markdown",
+    })
+
     tickets = []
-    start = 0
-    while True:
-        resp = requests.get(
-            f"{base}/rest/api/3/search",
-            headers=headers,
-            params={"jql": jql, "startAt": start, "maxResults": 50,
-                    "fields": "summary,status,assignee,priority,resolutiondate,labels,parent"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        issues = data.get("issues", [])
-        if not issues:
-            break
-        for issue in issues:
-            f = issue["fields"]
-            tickets.append({
-                "key": issue["key"],
-                "summary": f.get("summary", ""),
-                "status": f.get("status", {}).get("name", ""),
-                "assignee": (f.get("assignee") or {}).get("displayName", "Unassigned"),
-                "priority": f.get("priority", {}).get("name", ""),
-                "labels": f.get("labels", []),
-                "url": f"{base}/browse/{issue['key']}",
-            })
-        start += len(issues)
-        if start >= data.get("total", 0):
-            break
+    try:
+        data = json.loads(text)
+        # Handle both {issues: [...]} and bare list
+        issues = data.get("issues", data) if isinstance(data, dict) else data
+        if isinstance(issues, list):
+            for issue in issues:
+                key = issue.get("key", "")
+                fields = issue.get("fields", issue)
+                status = fields.get("status", "")
+                assignee = fields.get("assignee") or {}
+                priority = fields.get("priority", "")
+                tickets.append({
+                    "key": key,
+                    "summary": fields.get("summary", ""),
+                    "status": status.get("name", "") if isinstance(status, dict) else str(status),
+                    "assignee": assignee.get("displayName", "Unassigned") if isinstance(assignee, dict) else "Unassigned",
+                    "priority": priority.get("name", "") if isinstance(priority, dict) else str(priority),
+                    "labels": fields.get("labels", []),
+                    "url": f"{base_url}/browse/{key}",
+                })
+        else:
+            # Non-JSON markdown summary — pass through as-is for Claude
+            tickets = [{"raw_summary": text}]
+    except json.JSONDecodeError:
+        tickets = [{"raw_summary": text}]
 
     print(f"  Jira: {len(tickets)} closed/transitioned tickets")
     return tickets
 
 
-# ---------------------------------------------------------------------------
-# Confluence
-# ---------------------------------------------------------------------------
-
-def fetch_confluence_context(config: dict) -> dict:
-    """GET the current Confluence page body and version for context + prepend."""
-    email = config["atlassian_email"]
-    token = config["atlassian_api_token"]
-    base = config["atlassian_base_url"]
+def fetch_confluence_context(atlassian: AtlassianMCP, config: dict) -> dict:
+    """GET the current Confluence page body for context and prepend target."""
     page_id = config["confluence_page_id"]
+    text = atlassian.call("getConfluencePage", {
+        "cloudId": atlassian.cloud_id,
+        "pageId": page_id,
+        "contentFormat": "markdown",
+    })
 
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
-    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+    try:
+        data = json.loads(text)
+        title = data.get("title", "Field AI - Weekly Updates")
+        # Body may be nested under data.body or at the top level
+        body = data.get("body", "") or text
+        if isinstance(body, dict):
+            body = body.get("value", "") or body.get("storage", {}).get("value", "") or str(body)
+    except json.JSONDecodeError:
+        title = "Field AI - Weekly Updates"
+        body = text
 
-    resp = requests.get(
-        f"{base}/wiki/rest/api/content/{page_id}",
-        headers=headers,
-        params={"expand": "body.storage,version,title"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return {
-        "title": data["title"],
-        "version": data["version"]["number"],
-        "body": data["body"]["storage"]["value"],
-    }
+    return {"title": title, "body": body}
+
+
+def update_confluence_page(atlassian: AtlassianMCP, config: dict, new_section: str, current: dict) -> None:
+    """Prepend new_section to the Confluence page and write back via MCP."""
+    page_id = config["confluence_page_id"]
+    date_header = datetime.now().strftime("%B %-d, %Y")
+    new_body = f"## Week of {date_header}\n\n{new_section}\n\n---\n\n{current['body']}"
+
+    atlassian.call("updateConfluencePage", {
+        "cloudId": atlassian.cloud_id,
+        "pageId": page_id,
+        "title": current["title"],
+        "body": new_body,
+        "contentFormat": "markdown",
+        "versionMessage": f"Weekly update {datetime.now().strftime('%Y-%m-%d')}",
+    })
+    print("  Confluence: page updated")
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +358,14 @@ SELECT DISTINCT
 FROM PROCORE_IT.GONG_DATA_CLOUD_PREP.GONG_CONVERSATIONS_PREP c
 JOIN PROCORE_IT.GONG_DATA_CLOUD_PREP.GONG_CALLS_PREP cl
   ON c.CONVERSATION_KEY = cl.CONVERSATION_KEY
+JOIN PROCORE_IT.GONG_DATA_CLOUD_PREP.GONG_CONVERSATION_PARTICIPANTS_PREP p
+  ON c.CONVERSATION_KEY = p.CONVERSATION_KEY
+  AND p.USER_ID IN (
+    SELECT DISTINCT USER_ID
+    FROM PROCORE_IT.GONG_DATA_CLOUD_PREP.GONG_CONVERSATION_PARTICIPANTS_PREP
+    WHERE LOWER(EMAIL_ADDRESS) IN ('kyle.weatherholtz@procore.com', 'michael.sinai@procore.com')
+      AND USER_ID IS NOT NULL
+  )
 LEFT JOIN PROCORE_IT.GONG_DATA_CLOUD_PREP.GONG_CONVERSATION_CONTEXTS_PREP cc
   ON c.CONVERSATION_KEY = cc.CONVERSATION_KEY AND cc.OBJECT_TYPE = 'Account'
 LEFT JOIN PROCORE_IT.SALESFORCE.ACCOUNT sa
@@ -301,7 +411,6 @@ def fetch_gong_data(config: dict, since: datetime) -> list:
         print("  Gong/Snowflake: could not parse JSON output", file=sys.stderr)
         return []
 
-    # Multi-statement queries return array of result sets; find the actual data rows
     sets = result_sets if isinstance(result_sets, list) else [result_sets]
     rows = []
     for rs in reversed(sets):
@@ -333,7 +442,6 @@ GRANOLA_MCP_URL = "https://mcp.granola.ai/mcp"
 
 
 def _mcp_rpc(proc, method: str, params: dict, req_id: int) -> dict:
-    """Send a JSON-RPC request over stdio and read the response."""
     payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}) + "\n"
     proc.stdin.write(payload)
     proc.stdin.flush()
@@ -344,7 +452,7 @@ def _mcp_rpc(proc, method: str, params: dict, req_id: int) -> dict:
 
 
 def fetch_granola_notes(since: datetime) -> list:
-    """Spawn npx mcp-remote, list notes from the past week via MCP JSON-RPC."""
+    """Spawn npx mcp-remote, list meetings from the past week via MCP JSON-RPC."""
     notes = []
     try:
         proc = subprocess.Popen(
@@ -360,7 +468,6 @@ def fetch_granola_notes(since: datetime) -> list:
         return []
 
     try:
-        # Initialize
         init_resp = _mcp_rpc(proc, "initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
@@ -370,58 +477,53 @@ def fetch_granola_notes(since: datetime) -> list:
             print(f"  Granola MCP init error: {init_resp['error']}", file=sys.stderr)
             return []
 
-        # Send initialized notification
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         proc.stdin.flush()
 
-        # List available tools
-        tools_resp = _mcp_rpc(proc, "tools/list", {}, 2)
-        tools = {t["name"] for t in tools_resp.get("result", {}).get("tools", [])}
+        # Step 1: list meetings in the time window
+        list_resp = _mcp_rpc(proc, "tools/call", {
+            "name": "list_meetings",
+            "arguments": {
+                "time_range": "custom",
+                "custom_start": since.strftime("%Y-%m-%d"),
+                "custom_end": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            },
+        }, 2)
 
-        # Try list_notes or search_notes — tool name varies by Granola MCP version
-        list_tool = next((t for t in ["list_notes", "get_notes", "search_notes"] if t in tools), None)
-        if not list_tool:
-            print(f"  Granola: no note-listing tool found (available: {tools})", file=sys.stderr)
+        meeting_ids = []
+        for item in list_resp.get("result", {}).get("content", []):
+            text = item.get("text", "")
+            # Response is XML-like with email addresses in <> — use regex not XML parser
+            for m in re.finditer(r'<meeting id="([^"]+)" title="([^"]+)" date="([^"]+)"', text):
+                meeting_ids.append({"id": m.group(1), "title": m.group(2), "date": m.group(3)})
+
+        if not meeting_ids:
+            print("  Granola: 0 meetings found in time range")
             return []
 
-        since_iso = since.isoformat()
-        list_resp = _mcp_rpc(proc, "tools/call", {
-            "name": list_tool,
-            "arguments": {"since": since_iso, "limit": 50},
-        }, 3)
+        # Step 2: fetch full content in batches of 10
+        req_id = 3
+        for i in range(0, len(meeting_ids), 10):
+            batch_meta = meeting_ids[i:i + 10]
+            batch_ids = [m["id"] for m in batch_meta]
+            detail_resp = _mcp_rpc(proc, "tools/call", {
+                "name": "get_meetings",
+                "arguments": {"meeting_ids": batch_ids},
+            }, req_id)
+            req_id += 1
 
-        result = list_resp.get("result", {})
-        content_items = result.get("content", [])
-        req_id = 4
-
-        for item in content_items:
-            text = item.get("text", "")
-            try:
-                note_list = json.loads(text)
-                if not isinstance(note_list, list):
-                    note_list = [note_list]
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            for note_meta in note_list:
-                note_id = note_meta.get("id") or note_meta.get("noteId")
-                title = note_meta.get("title", "Untitled")
-                date = note_meta.get("date") or note_meta.get("created_at", "")
-
-                # Fetch full content if there's a get_note tool
-                content = note_meta.get("content", "")
-                if not content and "get_note" in tools and note_id:
-                    detail_resp = _mcp_rpc(proc, "tools/call", {
-                        "name": "get_note",
-                        "arguments": {"id": note_id},
-                    }, req_id)
-                    req_id += 1
-                    for ci in detail_resp.get("result", {}).get("content", []):
-                        if ci.get("type") == "text":
-                            content = ci["text"][:1000]
-                            break
-
-                notes.append({"title": title, "date": date, "content": content[:1000]})
+            for item in detail_resp.get("result", {}).get("content", []):
+                text = item.get("text", "")
+                # Parse each <meeting ...> block with regex (email addresses break XML parsers)
+                for match in re.finditer(
+                    r'<meeting id="([^"]+)" title="([^"]+)" date="([^"]+)">(.*?)</meeting>',
+                    text,
+                    re.DOTALL,
+                ):
+                    mid, title, date, body = match.group(1), match.group(2), match.group(3), match.group(4)
+                    summary_match = re.search(r'<summary>(.*?)</summary>', body, re.DOTALL)
+                    summary = summary_match.group(1).strip()[:1000] if summary_match else ""
+                    notes.append({"title": title, "date": date, "content": summary})
 
     except Exception as e:
         print(f"  Granola: error — {e}", file=sys.stderr)
@@ -489,11 +591,43 @@ Rules:
 """
 
 
+def _anthropic_client(config: dict) -> anthropic.Anthropic:
+    """Build an Anthropic client, falling back to the Claude Code gateway if no API key is set."""
+    api_key = config.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    base_url = None
+
+    if not api_key:
+        # Reuse the Claude Code LLM gateway from ~/.claude/settings.json
+        settings_path = Path.home() / ".claude" / "settings.json"
+        if settings_path.exists():
+            with open(settings_path) as f:
+                settings = json.load(f)
+            env = settings.get("env", {})
+            api_key = env.get("ANTHROPIC_AUTH_TOKEN")
+            base_url = env.get("ANTHROPIC_BASE_URL")
+            # Stash gateway model IDs for use in synthesize_update
+            config.setdefault("_gateway_opus_model", env.get("ANTHROPIC_DEFAULT_OPUS_MODEL"))
+            config.setdefault("_gateway_sonnet_model", env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+
+    if not api_key:
+        sys.exit("No Anthropic API key found. Set anthropic_api_key in config.json or ANTHROPIC_API_KEY in environment.")
+
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return anthropic.Anthropic(**kwargs)
+
+
 def synthesize_update(all_data: dict, config: dict, today: datetime) -> str:
     """Call Claude API to synthesize the LT update from all collected data."""
-    client = anthropic.Anthropic(api_key=config["anthropic_api_key"])
+    client = _anthropic_client(config)
+    model = (
+        config.get("anthropic_model")
+        or config.get("_gateway_opus_model")
+        or "claude-opus-4-6"
+    )
 
-    date_str = today.strftime("%B %-d")  # e.g. "April 18"
+    date_str = today.strftime("%B %-d")
 
     data_block = f"""
 ## Raw data for the week ending {today.strftime('%Y-%m-%d')}
@@ -518,7 +652,7 @@ def synthesize_update(all_data: dict, config: dict, today: datetime) -> str:
 """
 
     message = client.messages.create(
-        model="claude-opus-4-6",
+        model=model,
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         messages=[
@@ -533,86 +667,13 @@ def synthesize_update(all_data: dict, config: dict, today: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Confluence write
-# ---------------------------------------------------------------------------
-
-def _as_confluence_storage(markdown_text: str) -> str:
-    """Wrap the markdown update in a Confluence storage format panel."""
-    # Escape for XML inside Confluence storage format
-    escaped = (
-        markdown_text
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-    # Wrap each line to preserve formatting
-    lines_html = "".join(f"<p>{line}</p>" if line.strip() else "<p></p>" for line in escaped.split("\n"))
-    return f'<ac:structured-macro ac:name="panel"><ac:parameter ac:name="title">Week of {datetime.now().strftime("%B %-d, %Y")}</ac:parameter><ac:rich-text-body>{lines_html}</ac:rich-text-body></ac:structured-macro><hr/>'
-
-
-def update_confluence_page(config: dict, new_section: str) -> None:
-    """Prepend new_section to the Confluence page body and PUT the update."""
-    email = config["atlassian_email"]
-    token = config["atlassian_api_token"]
-    base = config["atlassian_base_url"]
-    page_id = config["confluence_page_id"]
-
-    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
-    headers = {
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    # GET current page
-    resp = requests.get(
-        f"{base}/wiki/rest/api/content/{page_id}",
-        headers=headers,
-        params={"expand": "body.storage,version,title"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    page = resp.json()
-    current_body = page["body"]["storage"]["value"]
-    current_version = page["version"]["number"]
-    title = page["title"]
-
-    # Prepend new section
-    new_body = _as_confluence_storage(new_section) + "\n" + current_body
-
-    payload = {
-        "id": page_id,
-        "type": "page",
-        "title": title,
-        "version": {"number": current_version + 1},
-        "body": {
-            "storage": {
-                "value": new_body,
-                "representation": "storage",
-            }
-        },
-    }
-
-    put_resp = requests.put(
-        f"{base}/wiki/rest/api/content/{page_id}",
-        headers=headers,
-        json=payload,
-        timeout=30,
-    )
-    put_resp.raise_for_status()
-    print(f"  Confluence: page updated to version {current_version + 1}")
-
-
-# ---------------------------------------------------------------------------
 # Output archive
 # ---------------------------------------------------------------------------
 
 def save_output(text: str, today: datetime) -> Path:
-    """Save generated update to output/YYYY-MM-DD.md."""
-    output_dir = Path(__file__).parent / "output"
-    output_dir.mkdir(exist_ok=True)
-    path = output_dir / f"{today.strftime('%Y-%m-%d')}.md"
+    output_dir = Path.home() / "AI-workshop" / "Procore Voice" / "updates"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"LT Update - {today.strftime('%Y-%m-%d')}.md"
     path.write_text(text)
     return path
 
@@ -650,50 +711,50 @@ def main():
 
     github_data = fetch_github_data(config, since)
 
-    jira_data = fetch_jira_data(config, since)
+    with AtlassianMCP() as atlassian:
+        print(f"  Atlassian MCP: connected (cloud_id={atlassian.cloud_id})")
+        jira_data = fetch_jira_data(atlassian, config, since)
+        confluence_ctx = fetch_confluence_context(atlassian, config)
+        print(f"  Confluence: loaded page '{confluence_ctx['title']}'")
 
-    confluence_ctx = fetch_confluence_context(config)
-    print(f"  Confluence: loaded page '{confluence_ctx['title']}' (v{confluence_ctx['version']})")
+        if args.skip_gong:
+            print("  Gong: skipped (--skip-gong)")
+            gong_data = []
+        else:
+            gong_data = fetch_gong_data(config, since)
 
-    if args.skip_gong:
-        print("  Gong: skipped (--skip-gong)")
-        gong_data = []
-    else:
-        gong_data = fetch_gong_data(config, since)
+        if args.skip_granola:
+            print("  Granola: skipped (--skip-granola)")
+            granola_data = []
+        else:
+            granola_data = fetch_granola_notes(since)
 
-    if args.skip_granola:
-        print("  Granola: skipped (--skip-granola)")
-        granola_data = []
-    else:
-        granola_data = fetch_granola_notes(since)
-
-    print()
-    print("Synthesizing update with Claude...")
-    all_data = {
-        "github": github_data,
-        "jira": jira_data,
-        "gong": gong_data,
-        "granola": granola_data,
-        "confluence_context": confluence_ctx["body"],
-    }
-    update_text = synthesize_update(all_data, config, today)
-
-    # Always save locally
-    saved_path = save_output(update_text, today)
-    print(f"  Saved to: {saved_path}")
-    print()
-
-    if args.dry_run:
-        print("=" * 70)
-        print(update_text)
-        print("=" * 70)
         print()
-        print("DRY RUN — Confluence not updated.")
-    else:
-        print("Writing to Confluence...")
-        update_confluence_page(config, update_text)
+        print("Synthesizing update with Claude...")
+        all_data = {
+            "github": github_data,
+            "jira": jira_data,
+            "gong": gong_data,
+            "granola": granola_data,
+            "confluence_context": confluence_ctx["body"],
+        }
+        update_text = synthesize_update(all_data, config, today)
+
+        saved_path = save_output(update_text, today)
+        print(f"  Saved to: {saved_path}")
         print()
-        print("Done.")
+
+        if args.dry_run:
+            print("=" * 70)
+            print(update_text)
+            print("=" * 70)
+            print()
+            print("DRY RUN — Confluence not updated.")
+        else:
+            print("Writing to Confluence...")
+            update_confluence_page(atlassian, config, update_text, confluence_ctx)
+            print()
+            print("Done.")
 
 
 if __name__ == "__main__":
