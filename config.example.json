@@ -1,6 +1,4 @@
 {
-  "atlassian_email": "kyle.weatherholtz@procore.com",
-  "atlassian_api_token": "<generate at https://id.atlassian.net/manage-profile/security/api-tokens>",
   "atlassian_base_url": "https://procoretech.atlassian.net",
   "confluence_page_id": "5282955265",
   "jira_projects": ["FSAD", "MARCH"],
